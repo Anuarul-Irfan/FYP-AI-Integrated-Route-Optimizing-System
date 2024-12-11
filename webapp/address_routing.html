@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <base target="_top" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <title>OpenStreetMap POI Routing With Neo4j</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.2/dist/leaflet.css"
+    integrity="sha256-sA+zWATbFveLLNqWO2gtiw3HL/lh1giY/Inf1BJ0z14=" crossorigin="" />
+  <link rel="stylesheet" href="https://unpkg.com/@geoman-io/leaflet-geoman-free@latest/dist/leaflet-geoman.css" />
+
+  <script src="https://unpkg.com/leaflet@1.9.2/dist/leaflet.js"
+    integrity="sha256-o9N1jGDZrf5tS+Ft4gbIK7mYMipq9lqpVJ91xHSyKhg=" crossorigin=""></script>
+  <script src="https://unpkg.com/@geoman-io/leaflet-geoman-free@latest/dist/leaflet-geoman.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+  <script src="https://unpkg.com/neo4j-driver"></script>
+
+  <style>
+    html,
+    body {
+      height: 100%;
+      margin: 0;
+    }
+
+    body {
+      font: 16px Arial;
+    }
+
+    .autocomplete {
+      position: relative;
+      display: inline-block;
+    }
+
+    input {
+      border: 1px solid transparent;
+      background-color: #f1f1f1;
+      padding: 10px;
+      font-size: 16px;
+    }
+
+    input[type="text"] {
+      background-color: #f1f1f1;
+      width: 100%;
+    }
+
+    input[type="submit"] {
+      background-color: DodgerBlue;
+      color: #fff;
+    }
+
+    .autocomplete-items {
+      position: absolute;
+      border: 1px solid #d4d4d4;
+      border-bottom: none;
+      border-top: none;
+      z-index: 999;
+      top: 100%;
+      left: 0;
+      right: 0;
+    }
+
+    .autocomplete-items div {
+      padding: 10px;
+      cursor: pointer;
+      background-color: #fff;
+      border-bottom: 1px solid #d4d4d4;
+    }
+
+    .autocomplete-items div:hover {
+      background-color: #e9e9e9;
+    }
+
+    .autocomplete-active {
+      background-color: DodgerBlue !important;
+      color: #ffffff;
+    }
+
+    #loading {
+      display: none;
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 20px;
+      color: blue;
+    }
+  </style>
+</head>
+
+<body>
+  <form autocomplete="off" action="#">
+    <div class="autocomplete" style="width: 300px">
+      <input id="source" type="text" name="source" placeholder="From (POI)" />
+      <input id="dest" type="text" name="dest" placeholder="To (POI)" />
+    </div>
+    <input id="routeButton" type="submit" value="Route" />
+  </form>
+
+  <div id="map" style="width: 100%; height: 100%"></div>
+  <div id="loading">Loading route, please wait...</div>
+
+  <script>
+    const driver = neo4j.driver(
+      "neo4j+s://241e42c3.databases.neo4j.io", // Replace with your Neo4j instance URL
+      neo4j.auth.basic("neo4j", "kluPre4qrTiPVhKhxnaJd5XwwlRJNz4ZvOAj58o9hDE") // Replace with your Neo4j credentials
+    );
+
+    const map = L.map("map", { zoomControl: false }).setView(
+      [3.1390, 101.6869], // Kuala Lumpur coordinates
+      13
+    );
+
+    L.control
+      .zoom({ position: "bottomright" })
+      .addTo(map);
+
+    const tiles = L.tileLayer(
+      "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+      {
+        maxZoom: 19,
+        attribution:
+          '&copy; <a href="http://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+      }
+    ).addTo(map);
+
+    function autocomplete(inp) {
+      let currentFocus;
+      inp.addEventListener("input", function () {
+        const val = this.value;
+        if (!val || val.length < 3) return;
+
+        closeAllLists();
+        const session = driver.session();
+        session
+          .run(
+            `
+              CALL db.index.fulltext.queryNodes("search_index", $searchString)
+              YIELD node, score
+              WHERE "PointOfInterest" IN labels(node)
+              RETURN coalesce(node.name) AS value, node.id AS id
+              ORDER BY score DESC LIMIT 10
+              `,
+            { searchString: val }
+          )
+          .then((result) => {
+            const a = document.createElement("DIV");
+            a.setAttribute("id", this.id + "autocomplete-list");
+            a.setAttribute("class", "autocomplete-items");
+            this.parentNode.appendChild(a);
+
+            result.records.forEach((record) => {
+              const b = document.createElement("DIV");
+              const name = record.get("value");
+              const id = record.get("id");
+              b.innerHTML = name;
+              b.innerHTML += `<input type='hidden' data-id='${id}' value='${name}'>`;
+              b.addEventListener("click", function () {
+                inp.value = this.getElementsByTagName("input")[0].value;
+                inp.dataset.id = this.getElementsByTagName("input")[0].dataset.id;
+                closeAllLists();
+              });
+              a.appendChild(b);
+            });
+          })
+          .catch(console.error);
+      });
+
+      inp.addEventListener("keydown", function (e) {
+        let x = document.getElementById(this.id + "autocomplete-list");
+        if (x) x = x.getElementsByTagName("div");
+        if (e.keyCode === 40) {
+          currentFocus++;
+          addActive(x);
+        } else if (e.keyCode === 38) {
+          currentFocus--;
+          addActive(x);
+        } else if (e.keyCode === 13) {
+          e.preventDefault();
+          if (currentFocus > -1 && x) x[currentFocus].click();
+        }
+      });
+
+      function addActive(x) {
+        if (!x) return false;
+        removeActive(x);
+        if (currentFocus >= x.length) currentFocus = 0;
+        if (currentFocus < 0) currentFocus = x.length - 1;
+        x[currentFocus].classList.add("autocomplete-active");
+      }
+
+      function removeActive(x) {
+        for (let i = 0; i < x.length; i++) {
+          x[i].classList.remove("autocomplete-active");
+        }
+      }
+
+      function closeAllLists(elmnt) {
+        const x = document.getElementsByClassName("autocomplete-items");
+        for (let i = 0; i < x.length; i++) {
+          if (elmnt !== x[i] && elmnt !== inp) {
+            x[i].parentNode.removeChild(x[i]);
+          }
+        }
+      }
+
+      document.addEventListener("click", function (e) {
+        closeAllLists(e.target);
+      });
+    }
+
+    autocomplete(document.getElementById("source"));
+    autocomplete(document.getElementById("dest"));
+
+    document.getElementById("routeButton").addEventListener("click", (e) => {
+      e.preventDefault();
+
+      const sourceId = document.getElementById("source").dataset.id;
+      const destId = document.getElementById("dest").dataset.id;
+
+      if (!sourceId || !destId) {
+        alert("Please select valid POIs.");
+        return;
+      }
+
+      getRoute({ source: sourceId, dest: destId });
+    });
+
+    function getRoute({ source, dest }) {
+      const session = driver.session();
+
+      const loadingElement = document.getElementById("loading");
+      loadingElement.style.display = "block";
+
+      session
+        .run(
+          `
+          MATCH (from:PointOfInterest {id: $source})-[:NEAREST_INTERSECTION]->(start:Intersection),
+                (to:PointOfInterest {id: $dest})-[:NEAREST_INTERSECTION]->(end:Intersection)
+          CALL apoc.algo.dijkstra(start, end, 'ROAD_SEGMENT', 'length')
+          YIELD path, weight
+          RETURN [n IN nodes(path) | [n.location.latitude, n.location.longitude]] AS route
+          `,
+          { source, dest }
+        )
+        .then((result) => {
+          if (result.records.length === 0) {
+            throw new Error("No route found between the selected points.");
+          }
+
+          const routeCoords = result.records[0].get("route");
+          const polyline = L.polyline(routeCoords, { color: "red", weight: 5 }).addTo(map);
+          map.fitBounds(polyline.getBounds());
+        })
+        .catch((error) => {
+          console.error("Error fetching route:", error);
+          alert(error.message || "Failed to fetch the route. Please try again.");
+        })
+        .finally(() => {
+          loadingElement.style.display = "none";
+          session.close();
+        });
+    }
+  </script>
+</body>
+
+</html>
